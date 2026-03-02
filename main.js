@@ -19,8 +19,12 @@
     // 配置中心（常量集中管理）
     const CONFIG = {
         BASE_URL: 'https://linux.do',          // 基础URL
+        ENABLE_LOG: true,                    // 是否输出调试日志
+        AUTO_CLICK_BACK_BUTTON: false,       // 是否自动点击“返回上一个未读帖子”按钮
         LIKE_LIMIT: 20,                      // 每日点赞上限
         MAX_RETRIES: 3,                      // 错误页面最大重试次数
+        PAGE_READY_RETRIES: 8,              // 页面内容未就绪时重试次数
+        PAGE_READY_INTERVAL: 800,           // 页面内容重试间隔（毫秒）
         SCROLL_OPTIONS: {                    // 滚动配置
             speed: 50,                       // 滚动速度（像素/次）
             interval: 100,                   // 滚动间隔（毫秒）
@@ -55,7 +59,13 @@
         // 从localStorage加载状态
         loadFromStorage() {
             // 解析存储的状态对象，默认空对象
-            const state = JSON.parse(localStorage.getItem('autoReadState')) || {};
+            let state = {};
+            try {
+                state = JSON.parse(localStorage.getItem('autoReadState')) || {};
+            } catch (error) {
+                console.error('[AutoRead] 本地状态解析失败，已自动重置：', error);
+                localStorage.removeItem('autoReadState');
+            }
             // 合并默认状态与存储状态
             Object.assign(this, {
                 isReading: !!state.isReading,        // 布尔值转换
@@ -68,7 +78,13 @@
 
         // 保存状态到localStorage
         saveToStorage() {
-            localStorage.setItem('autoReadState', JSON.stringify(this));
+            // 仅持久化可序列化且必要的字段，避免DOM对象导致序列化异常
+            localStorage.setItem('autoReadState', JSON.stringify({
+                isReading: this.isReading,
+                isLiking: this.isLiking,
+                errorRetries: this.errorRetries,
+                unseenHrefs: this.unseenHrefs
+            }));
         }
 
         // 每日点赞计数重置（超过24小时）
@@ -88,15 +104,45 @@
     class AutoReader {
         constructor() {
             this.state = new StateManager();  // 初始化状态管理器
+            this.pageReadyRetries = 0;        // 当前页面就绪重试计数（运行时状态）
+            this.isInitialized = false;       // 防止重复初始化
             this.init();                      // 初始化脚本
+        }
+
+        // 统一日志输出（便于排查流程问题）
+        log(message, data) {
+            if (!CONFIG.ENABLE_LOG) return;
+            const time = new Date().toLocaleTimeString();
+            if (data !== undefined) {
+                console.log(`[AutoRead ${time}] ${message}`, data);
+            } else {
+                console.log(`[AutoRead ${time}] ${message}`);
+            }
         }
 
         // 初始化入口
         init() {
-            window.addEventListener('load', () => {
+            const bootstrap = () => {
+                if (this.isInitialized) return;
+                this.isInitialized = true;
+                this.log('执行初始化', { readyState: document.readyState });
                 this.createControlPanel();   // 创建控制面板
                 this.handleRoute();          // 处理当前路由
                 setInterval(() => this.updateStatus(), CONFIG.UPDATE_INTERVAL); // 定期更新状态
+            };
+
+            // 页面已可用时立即初始化，避免错过load事件导致不执行
+            if (document.readyState === 'interactive' || document.readyState === 'complete') {
+                bootstrap();
+            } else {
+                document.addEventListener('DOMContentLoaded', bootstrap, { once: true });
+                window.addEventListener('load', bootstrap, { once: true });
+            }
+
+            // bfcache 场景下返回页面会触发 pageshow，这里补一次路由处理
+            window.addEventListener('pageshow', () => {
+                this.log('pageshow 触发，重新处理路由');
+                this.handleRoute();
             });
         }
 
@@ -105,9 +151,17 @@
          * 根据当前页面路径执行不同逻辑
          */
         handleRoute() {
+            if (!this.state.isReading) return; // 未开启阅读时不自动执行
+
+            this.log('路由处理开始', {
+                pathname: window.location.pathname,
+                remaining: this.state.unseenHrefs.length,
+                isReading: this.state.isReading
+            });
+
             if (window.location.pathname === '/unseen') { // 未读页面
                 this.fetchUnseenLinks();  // 获取未读链接
-            } else if (this.state.isReading) { // 阅读中状态
+            } else { // 阅读中状态
                 this.processCurrentPage();  // 处理当前页面内容
             }
         }
@@ -119,6 +173,7 @@
             // 使用CSS选择器获取所有未读帖子链接
             const links = Array.from(document.querySelectorAll('a.title.raw-link.raw-topic-link'))
                 .map(link => link.getAttribute('href'));  // 提取链接
+            this.log('抓取未读链接完成', { count: links.length });
 
             if (links.length) { // 存在未读链接
                 this.state.unseenHrefs = links;            // 更新状态
@@ -135,10 +190,17 @@
         openNextTopic() {
             const nextUrl = this.state.unseenHrefs.shift(); // 取出队列中第一个链接
             if (nextUrl) { // 存在有效链接
+                const targetUrl = new URL(nextUrl, CONFIG.BASE_URL).href; // 兼容相对/绝对链接
+                this.log('打开下一个帖子', {
+                    nextUrl,
+                    targetUrl,
+                    remaining: this.state.unseenHrefs.length
+                });
                 this.state.currentTask = 'navigating';      // 设置任务状态为导航
                 this.state.saveToStorage();                // 保存状态
-                window.location.href = `${CONFIG.BASE_URL}${nextUrl}`; // 跳转页面
+                window.location.href = targetUrl; // 跳转页面
             } else { // 链接队列已空
+                this.log('未读链接为空，返回 /unseen');
                 this.navigateToUnseen();                    // 回到未读页面重新获取
             }
         }
@@ -151,17 +213,31 @@
 
             // 判断是不是帖子详情页，如果不是，打开第一个未读链接
             if (!document.querySelector('article[data-post-id]')) {
+                this.pageReadyRetries++;
+                if (this.pageReadyRetries <= CONFIG.PAGE_READY_RETRIES) {
+                    this.log('帖子内容未就绪，延迟重试', {
+                        retry: this.pageReadyRetries,
+                        max: CONFIG.PAGE_READY_RETRIES
+                    });
+                    setTimeout(() => this.processCurrentPage(), CONFIG.PAGE_READY_INTERVAL);
+                    return;
+                }
+                this.log('页面重试超限，尝试打开下一个帖子');
+                this.pageReadyRetries = 0;
                 this.openNextTopic();
                 return;
             }
+            this.pageReadyRetries = 0;
             // 判断是否存在返回上次阅读的按钮
             const backButton = document.querySelector('[title="返回上一个未读帖子"]');
-            if (backButton) {
+            if (backButton && CONFIG.AUTO_CLICK_BACK_BUTTON) {
+                this.log('检测到返回未读按钮，执行点击');
                 backButton.click(); // 点击按钮返回
             }
 
             // 获取当前页面所有帖子
-            this.state.posts = Array.from(document.querySelectorAll('article[data-post-id]'));
+            const posts = Array.from(document.querySelectorAll('article[data-post-id]'));
+            this.log('开始处理帖子页面', { postCount: posts.length });
             this.state.currentTask = 'scrolling';             // 设置任务状态为滚动
             this.startSmoothScroll();                         // 启动平滑滚动
             if (this.state.isLiking) this.runAutoLike();       // 启用点赞则执行点赞逻辑
@@ -172,14 +248,21 @@
          */
         startSmoothScroll() {
             if (this.state.scrollTimer) return; // 避免重复启动
+            this.log('启动平滑滚动');
 
             // 记录上一次滚动时间
             let lastScrollTime = 0;
+            let noMoveFrames = 0; // 连续未移动帧数，用于兜底判定到底
             // 滚动速度（像素/帧）
             const scrollSpeed = CONFIG.SCROLL_OPTIONS.speed;
+            const scrollElement = document.scrollingElement || document.documentElement;
 
             // 使用requestAnimationFrame实现平滑滚动
             const scrollStep = () => {
+                if (!this.state.isReading) {
+                    this.stopScrolling();
+                    return;
+                }
                 let timestamp = performance.now(); // 获取当前时间戳
 
                 // 控制滚动频率，防止过快
@@ -189,18 +272,37 @@
                 }
                 lastScrollTime = timestamp; // 更新上一次滚动时间
 
-                window.scrollBy(0, scrollSpeed); // 执行滚动
+                const beforeTop = scrollElement.scrollTop;
+                scrollElement.scrollTop = beforeTop + scrollSpeed; // 执行滚动
+                window.scrollBy(0, scrollSpeed); // 兜底滚动（兼容部分页面滚动容器差异）
+                const afterTop = scrollElement.scrollTop;
+                noMoveFrames = afterTop === beforeTop ? noMoveFrames + 1 : 0;
 
                 // 判断是否阅读完毕
                 const divReplies = document.querySelector('div.timeline-replies'); // 查找底部元素
-                if (divReplies) {
-                    const parts = divReplies.textContent.trim().replace(/[^0-9/]/g, '').split('/');
-                    // 判断是否相等（如：1/1），表示已到达底部
-                    if (parts.length >= 2 && parts[0] === parts[1]) {
-                        this.stopScrolling();       // 停止滚动
-                        this.openNextTopic();       // 打开下一个帖子
-                        return;
+                let isRepliesDone = false;
+                let progressText = '';
+                if (divReplies?.textContent) {
+                    progressText = divReplies.textContent.trim();
+                    const match = progressText.match(/(\d+)\s*\/\s*(\d+)/);
+                    if (match) {
+                        const current = Number(match[1]);
+                        const total = Number(match[2]);
+                        isRepliesDone = total > 0 && current >= total;
                     }
+                }
+
+                const nearBottom = afterTop + window.innerHeight >= scrollElement.scrollHeight - 8;
+                const isBottomFallback = nearBottom && noMoveFrames >= 5;
+                if (isRepliesDone || isBottomFallback) {
+                    this.log('检测到阅读到底，切换下一帖子', {
+                        progress: progressText || '未知',
+                        nearBottom,
+                        noMoveFrames
+                    });
+                    this.stopScrolling();       // 停止滚动
+                    this.openNextTopic();       // 打开下一个帖子
+                    return;
                 }
 
                 this.markReadPosts();           // 标记已读帖子
@@ -218,6 +320,7 @@
             if (this.state.scrollTimer) {
                 cancelAnimationFrame(this.state.scrollTimer); // 取消动画帧
                 this.state.scrollTimer = null;         // 重置定时器引用
+                this.log('停止滚动');
             }
             this.state.currentTask = null;         // 清除当前任务
         }
@@ -268,8 +371,13 @@
          */
         handleError() {
             this.state.errorRetries++; // 重试次数加一
+            this.log('进入错误页面处理', {
+                retries: this.state.errorRetries,
+                maxRetries: CONFIG.MAX_RETRIES
+            });
 
             if (this.state.errorRetries > CONFIG.MAX_RETRIES) { // 超过最大重试次数
+                this.log('错误重试超过上限，重置状态');
                 this.resetState();                             // 重置所有状态
                 return;
             }
